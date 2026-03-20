@@ -302,7 +302,7 @@ class TripletTableModel(QAbstractTableModel):
         """Replace the model's data with a new dictionary of counts."""
         self.layoutAboutToBeChanged.emit()
         df = pd.DataFrame(list(type_counts.items()), columns=["Triplet Type", "Count"])
-        df.sort_values(by="Triplet Type", inplace=True, ascending=False)   # optional initial sort
+        df.sort_values(by="Count", inplace=True, ascending=False)   # optional initial sort
         df.reset_index(drop=True, inplace=True)
         self._data = df
         self.layoutChanged.emit()
@@ -319,7 +319,7 @@ class TripletTableModel(QAbstractTableModel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Membrane Protein Triplet Visualiser")
+        self.setWindowTitle("INTERFACE3-replica")
         self.setMinimumSize(1200, 800)
 
         self.pdb_bytes = None
@@ -477,6 +477,7 @@ class MainWindow(QMainWindow):
             self.info_label.setText("No valid triplets found.")
             self.table_model.clear()
             self.type_combo.clear()
+            self.type_combo.setMaxVisibleItems(10)
             self.type_combo.setEnabled(False)
             return
 
@@ -490,8 +491,8 @@ class MainWindow(QMainWindow):
         # Fill combo
         self.type_combo.clear()
         types = self.table_model._data["Triplet Type"].tolist()
-        self.type_combo.setMaxVisibleItems(10)
         self.type_combo.addItems(types)
+        self.type_combo.setMaxVisibleItems(10)
         self.type_combo.setEnabled(True)
 
         # Show first type
@@ -523,6 +524,8 @@ class MainWindow(QMainWindow):
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyle('fusion')
+    app.setStyleSheet('QComboBox {combobox-popup: 0}')  # this shows the normal scrollable list-view with max visible items
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
