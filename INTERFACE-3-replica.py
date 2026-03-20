@@ -1,18 +1,27 @@
-import streamlit as st
-import pandas as pd
+import sys
+import os
+from io import StringIO
 import numpy as np
+import pandas as pd
 from Bio import PDB
 import alphashape
 from collections import defaultdict, Counter
-import tempfile
-import io
+import py3Dmol
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QRadioButton, QButtonGroup,
+    QDoubleSpinBox, QComboBox, QTableWidget, QTableWidgetItem,
+    QHeaderView, QGroupBox, QFileDialog, QMessageBox, QTableView
+)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QAbstractTableModel, QModelIndex
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+
 
 # -------------------------------------------------------------------
-# Helper functions (adapted from the original code)
+# Helper functions (identical to the original code)
 # -------------------------------------------------------------------
-
 def _parse_helix_record(line: str) -> dict:
-    """Parse a HELIX record from a PDB file."""
     data = line.split()
     helix_id = int(data[2])
     chain = data[4]
@@ -22,22 +31,19 @@ def _parse_helix_record(line: str) -> dict:
             'start_residue': start, 'end_residue': end}
 
 
-def parse_pdb_with_helix(pdb_path, atom_type='heavy'):
-    """
-    Parse a PDB file, extract atomic coordinates and metadata,
-    and assign helix IDs based on HELIX records.
-    """
-    parser = PDB.PDBParser(QUIET=True)
-    structure = parser.get_structure('protein', pdb_path)
-
-    # Build helix map from HELIX records in the file
+def parse_pdb_with_helix_from_string(pdb_string, atom_type='heavy'):
+    # First pass: collect HELIX records
     helix_map = {}
-    with open(pdb_path, 'r') as f:
-        for line in f:
-            if line.startswith('HELIX'):
-                rec = _parse_helix_record(line)
-                for resnum in range(rec['start_residue'], rec['end_residue'] + 1):
-                    helix_map[(rec['chain_id'], resnum)] = rec['helix_id']
+    for line in pdb_string.splitlines():
+        if line.startswith('HELIX'):
+            rec = _parse_helix_record(line)
+            for resnum in range(rec['start_residue'], rec['end_residue'] + 1):
+                helix_map[(rec['chain_id'], resnum)] = rec['helix_id']
+
+    # Second pass: parse structure from the same string
+    handle = StringIO(pdb_string)
+    parser = PDB.PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', handle)
 
     coords = []
     atom_info = []
@@ -67,7 +73,6 @@ def parse_pdb_with_helix(pdb_path, atom_type='heavy'):
 
 
 def compute_alpha_edges(coords, alpha):
-    """Compute all atomic contact edges from the alpha shape."""
     simplices_data = list(alphashape.alphasimplices(coords))
     valid_simplices = [s for s, r in simplices_data if r <= alpha]
 
@@ -81,7 +86,6 @@ def compute_alpha_edges(coords, alpha):
 
 
 def build_adjacency(edges, n_atoms):
-    """Build adjacency list from edge set."""
     adj = [set() for _ in range(n_atoms)]
     for i, j in edges:
         adj[i].add(j)
@@ -90,7 +94,6 @@ def build_adjacency(edges, n_atoms):
 
 
 def find_triangles(adj):
-    """Find all triangles (3 mutually connected atoms) in the graph."""
     triangles = []
     n = len(adj)
     for i in range(n):
@@ -106,7 +109,6 @@ def find_triangles(adj):
 
 
 def one_letter_code(resname):
-    """Convert three‑letter residue code to one‑letter code."""
     three_to_one = {
         'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
         'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
@@ -117,13 +119,6 @@ def one_letter_code(resname):
 
 
 def filter_triangles(triangles, atom_info):
-    """
-    Keep only triangles where:
-      - three atoms belong to three different residues,
-      - all residues are in helices (helix_id not None),
-      - residues come from at least two different helices.
-    Returns list of dicts with 'atoms' and 'triplet_type'.
-    """
     valid = []
     for (i, j, k) in triangles:
         res_keys = (
@@ -148,96 +143,34 @@ def filter_triangles(triangles, atom_info):
     return valid
 
 
-# -------------------------------------------------------------------
-# Cached computation (heavy part)
-# -------------------------------------------------------------------
-@st.cache_data(show_spinner="Computing triplets...")
-def compute_triplets(pdb_bytes, atom_type, alpha):
+def get_residue_sphere_coords_from_set(atom_info, coords, residue_set):
     """
-    Run the full pipeline on the uploaded PDB file.
-    Returns:
-        pdb_string : str (content of PDB file for visualisation)
-        atom_info  : list of dict
-        coords     : np.ndarray
-        valid_triplets : list of dict
-        type_counts : dict {triplet_type: count}
+    Given atom_info, coords, and a set of (chain, resnum) tuples,
+    return atom_spheres and label_positions for those residues.
     """
-    # Write bytes to a temporary file for Bio.PDB and HELIX parsing
-    with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdb', delete=False) as tmp:
-        tmp.write(pdb_bytes)
-        tmp_path = tmp.name
-
-    # Read PDB content as string for later visualisation
-    pdb_string = pdb_bytes.decode('utf-8')
-
-    # Parse structure and extract atom info
-    coords, atom_info = parse_pdb_with_helix(tmp_path, atom_type)
-
-    if len(coords) < 4:
-        st.error("Need at least 4 atoms. Cannot compute alpha shape.")
-        return pdb_string, atom_info, coords, [], {}
-
-    # Compute edges
-    edges = compute_alpha_edges(coords, alpha)
-
-    # Find triangles
-    adj = build_adjacency(edges, len(coords))
-    triangles = find_triangles(adj)
-
-    # Filter triplets
-    valid_triplets = filter_triangles(triangles, atom_info)
-
-    # Count types
-    type_counts = Counter(t['triplet_type'] for t in valid_triplets)
-
-    return pdb_string, atom_info, coords, valid_triplets, type_counts
-
-
-# -------------------------------------------------------------------
-# Visualisation with py3Dmol
-# -------------------------------------------------------------------
-def get_residue_sphere_coords(atom_info, coords, triplet_type, valid_triplets):
-    """
-    For a given triplet type, find all residues involved.
-    Returns:
-        atom_spheres : list of (chain, resnum, resname, atom_name, element, x, y, z)
-        label_positions : list of (chain, resnum, resname, x, y, z) for CA (or first atom)
-    """
-    # Identify residues to show
-    residues_to_show = set()
-    for trip in valid_triplets:
-        if trip['triplet_type'] == triplet_type:
-            i, j, k = trip['atoms']
-            residues_to_show.add((atom_info[i]['chain'], atom_info[i]['resnum']))
-            residues_to_show.add((atom_info[j]['chain'], atom_info[j]['resnum']))
-            residues_to_show.add((atom_info[k]['chain'], atom_info[k]['resnum']))
-
     atom_spheres = []
-    label_candidates = {}  # (chain, resnum) -> (resname, coord, atom_name)
+    label_candidates = {}
 
     for idx, info in enumerate(atom_info):
         key = (info['chain'], info['resnum'])
-        if key in residues_to_show:
-            # Add atom sphere with element
+        if key in residue_set:
             atom_spheres.append((
                 info['chain'],
                 info['resnum'],
                 info['resname'],
                 info['atom_name'],
-                info['element'],           # now includes element
+                info['element'],
                 coords[idx][0],
                 coords[idx][1],
                 coords[idx][2]
             ))
 
-            # Update label candidate (prefer CA)
             if key not in label_candidates:
                 label_candidates[key] = (info['resname'], coords[idx], info['atom_name'])
             else:
                 if info['atom_name'] == 'CA' and label_candidates[key][2] != 'CA':
                     label_candidates[key] = (info['resname'], coords[idx], info['atom_name'])
 
-    # Build label positions
     label_positions = []
     for (chain, resnum), (resname, coord, _) in label_candidates.items():
         label_positions.append((chain, resnum, resname, coord[0], coord[1], coord[2]))
@@ -246,48 +179,37 @@ def get_residue_sphere_coords(atom_info, coords, triplet_type, valid_triplets):
 
 
 def render_py3dmol(pdb_string, atom_spheres, label_positions):
-    """
-    Generate an HTML string with py3Dmol view.
-    Spheres are coloured and sized by element.
-    """
-    import py3Dmol
-
-    # Element‑based colour scheme (CPK‑like)
     color_map = {
-    'C': 'gray', 'N': 'blue','O': 'red','S': 'yellow',
-    'H': 'white', 'CA': 'green','CB': 'gray','CD': 'gray',
-    'CG': 'gray','CE': 'gray','NZ': 'blue','OD1': 'red',
-    'OD2': 'red', 'NE': 'blue', 'NH1': 'blue', 'NH2': 'blue',
-    'OE1': 'red', 'OE2': 'red', 'ND2': 'blue', 'OG': 'red',
-    'OG1': 'red', 'SG': 'yellow', 'NE2': 'blue', 'ND1': 'blue',
-    'CE1': 'gray', 'CD2': 'gray', 'CG1': 'gray', 'CG2': 'gray',
-    'CD1': 'gray', 'CE2': 'gray', 'CZ': 'gray', 'OH': 'red',
-    'NE1': 'blue', 'CZ2': 'gray', 'CZ3': 'gray', 'CE3': 'gray',
-    'CH2': 'gray', 'SD': 'yellow', 'DEFAULT': 'gray',
+        'C': 'gray', 'N': 'blue', 'O': 'red', 'S': 'yellow',
+        'H': 'white', 'CA': 'green', 'CB': 'gray', 'CD': 'gray',
+        'CG': 'gray', 'CE': 'gray', 'NZ': 'blue', 'OD1': 'red',
+        'OD2': 'red', 'NE': 'blue', 'NH1': 'blue', 'NH2': 'blue',
+        'OE1': 'red', 'OE2': 'red', 'ND2': 'blue', 'OG': 'red',
+        'OG1': 'red', 'SG': 'yellow', 'NE2': 'blue', 'ND1': 'blue',
+        'CE1': 'gray', 'CD2': 'gray', 'CG1': 'gray', 'CG2': 'gray',
+        'CD1': 'gray', 'CE2': 'gray', 'CZ': 'gray', 'OH': 'red',
+        'NE1': 'blue', 'CZ2': 'gray', 'CZ3': 'gray', 'CE3': 'gray',
+        'CH2': 'gray', 'SD': 'yellow', 'DEFAULT': 'gray',
     }
 
-    # Radius per element (van der Waals radii scaled for visibility)
     radius_map = {
-    'C': 1.70, 'N': 1.55, 'O': 1.52, 'S': 1.80, 'H': 1.20,
-    'CA': 1.70, 'CB': 1.70, 'CD': 1.70, 'CG': 1.70, 'CE': 1.70,
-    'NZ': 1.55, 'OD1': 1.52, 'OD2': 1.52, 'NE': 1.55, 'NH1': 1.55,
-    'NH2': 1.55, 'OE1': 1.52, 'OE2': 1.52, 'ND2': 1.55, 'OG': 1.52,
-    'OG1': 1.52, 'SG': 1.80, 'NE2': 1.55, 'ND1': 1.55, 'CE1': 1.70,
-    'CD2': 1.70, 'CG1': 1.70, 'CG2': 1.70, 'CD1': 1.70, 'CE2': 1.70,
-    'CZ': 1.70, 'OH': 1.52, 'NE1': 1.55, 'CZ2': 1.70, 'CZ3': 1.70,
-    'CE3': 1.70, 'CH2': 1.70, 'SD': 1.80, 'CE': 1.70, 'DEFAULT': 1.70,
+        'C': 1.70, 'N': 1.55, 'O': 1.52, 'S': 1.80, 'H': 1.20,
+        'CA': 1.70, 'CB': 1.70, 'CD': 1.70, 'CG': 1.70, 'CE': 1.70,
+        'NZ': 1.55, 'OD1': 1.52, 'OD2': 1.52, 'NE': 1.55, 'NH1': 1.55,
+        'NH2': 1.55, 'OE1': 1.52, 'OE2': 1.52, 'ND2': 1.55, 'OG': 1.52,
+        'OG1': 1.52, 'SG': 1.80, 'NE2': 1.55, 'ND1': 1.55, 'CE1': 1.70,
+        'CD2': 1.70, 'CG1': 1.70, 'CG2': 1.70, 'CD1': 1.70, 'CE2': 1.70,
+        'CZ': 1.70, 'OH': 1.52, 'NE1': 1.55, 'CZ2': 1.70, 'CZ3': 1.70,
+        'CE3': 1.70, 'CH2': 1.70, 'SD': 1.80, 'CE': 1.70, 'DEFAULT': 1.70,
     }
 
     view = py3Dmol.view(width=800, height=600)
     view.addModel(pdb_string, 'pdb')
     view.setStyle({'cartoon': {'color': 'spectrum'}})
 
-    # Add spheres for all atoms
     for (chain, resnum, resname, atom_name, element, x, y, z) in atom_spheres:
-        # Use element for colour and radius, fallback to defaults
         colour = color_map.get(element, color_map['DEFAULT'])
         radius = radius_map.get(element, radius_map['DEFAULT'])
-
         view.addSphere({
             'center': {'x': float(x), 'y': float(y), 'z': float(z)},
             'radius': radius,
@@ -295,7 +217,6 @@ def render_py3dmol(pdb_string, atom_spheres, label_positions):
             'alpha': 0.98
         })
 
-    # Add labels at CA positions
     for (chain, resnum, resname, x, y, z) in label_positions:
         view.addLabel(f"{chain}:{resnum} {resname}", {
             'position': {'x': float(x), 'y': float(y), 'z': float(z)},
@@ -307,70 +228,301 @@ def render_py3dmol(pdb_string, atom_spheres, label_positions):
 
 
 # -------------------------------------------------------------------
-# Streamlit App
+# Worker thread
 # -------------------------------------------------------------------
-st.set_page_config(page_title="Membrane Protein Triplet Visualiser", layout="wide")
-st.title("🔬 Membrane Protein Triplet Extractor & Visualiser")
-st.markdown("""
-Upload a PDB file of a membrane protein.  
-The app will compute all residue triplets (three different residues from at least two different helices)  
-that are in contact according to an **alpha‑shape** of the atomic coordinates.
-""")
+class ComputeWorker(QThread):
+    finished = pyqtSignal(object, object, object, object, object)
+    error = pyqtSignal(str)
 
-# Sidebar
-with st.sidebar:
-    st.header("Input Parameters")
-    uploaded_file = st.file_uploader("Choose a PDB file", type=['pdb'])
-    atom_type = st.radio("Atom selection", options=['heavy', 'all'],
-                         help="'heavy' excludes hydrogens; 'all' includes all atoms.")
-    alpha = st.number_input("Alpha value (Å)", min_value=1.0, max_value=8.0, value=3.0, step=0.2)
-    compute_btn = st.button("Compute triplets", type="primary")
+    def __init__(self, pdb_bytes, atom_type, alpha):
+        super().__init__()
+        self.pdb_bytes = pdb_bytes
+        self.atom_type = atom_type
+        self.alpha = alpha
 
-# Main area (after sidebar)
-if uploaded_file is not None and compute_btn:
-    pdb_bytes = uploaded_file.getvalue()
+    def run(self):
+        try:
+            pdb_string = self.pdb_bytes.decode('utf-8')
+            coords, atom_info = parse_pdb_with_helix_from_string(pdb_string, self.atom_type)
 
-    # Run computation (cached)
-    pdb_string, atom_info, coords, valid_triplets, type_counts = compute_triplets(
-        pdb_bytes, atom_type, alpha
-    )
+            if len(coords) < 4:
+                self.error.emit("Need at least 4 atoms. Cannot compute alpha shape.")
+                return
 
-    # Store in session state
-    st.session_state['pdb_string'] = pdb_string
-    st.session_state['atom_info'] = atom_info
-    st.session_state['coords'] = coords
-    st.session_state['valid_triplets'] = valid_triplets
-    st.session_state['type_counts'] = type_counts
+            edges = compute_alpha_edges(coords, self.alpha)
+            adj = build_adjacency(edges, len(coords))
+            triangles = find_triangles(adj)
+            valid_triplets = filter_triangles(triangles, atom_info)
+            type_counts = Counter(t['triplet_type'] for t in valid_triplets)
 
-# Always display results if they exist in session state
-if 'valid_triplets' in st.session_state and st.session_state['valid_triplets']:
-    st.subheader("Results")
-    st.write(f"**Number of atoms selected:** {len(st.session_state['coords'])}")
-    st.write(f"**Valid triplets found:** {len(st.session_state['valid_triplets'])}")
+            self.finished.emit(pdb_string, atom_info, coords, valid_triplets, type_counts)
 
-    # Show a table of triplet types and counts
-    st.write("**Triplet type counts:**")
-    type_counts = st.session_state['type_counts']
-    type_df = pd.DataFrame(list(type_counts.items()), columns=['Triplet Type', 'Count']).sort_values(by='Count', ascending=False)
-    st.dataframe(type_df, use_container_width=True)
+        except Exception as e:
+            self.error.emit(str(e))
 
-    # Dropdown for selecting a triplet type
-    triplet_types = sorted(type_counts.keys())
-    selected_type = st.selectbox("Choose a triplet type to visualise", triplet_types)
+# -------------------------------------------------------------------
+# Pandas Table Model
+# -------------------------------------------------------------------
+class TripletTableModel(QAbstractTableModel):
+    def __init__(self):
+        super().__init__()
+        self._data = pd.DataFrame(columns=["Triplet Type", "Count"])
 
-    if selected_type:
-        atom_spheres, label_positions = get_residue_sphere_coords(
-            st.session_state['atom_info'],
-            st.session_state['coords'],
-            selected_type,
-            st.session_state['valid_triplets']
-        )
-        st.write(f"Highlighting **{len(atom_spheres)} atoms** from **{len(label_positions)} residues** involved in type **{selected_type}**.")
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._data)
 
-        html = render_py3dmol(st.session_state['pdb_string'], atom_spheres, label_positions)
-        st.components.v1.html(html, height=650)
+    def columnCount(self, parent=QModelIndex()):
+        return len(self._data.columns)
 
-elif uploaded_file is not None and not compute_btn:
-    st.info("Click 'Compute triplets' in the sidebar to start the analysis.")
-else:
-    st.info("Please upload a PDB file.")
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
+            value = self._data.iloc[index.row(), index.column()]
+            return str(value)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole:
+            if orientation == Qt.Orientation.Horizontal:
+                return self._data.columns[section]
+            else:
+                return str(section + 1)   # row numbers
+        return None
+
+    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
+        self.layoutAboutToBeChanged.emit()
+        self._data.sort_values(by=self._data.columns[column],
+                               ascending=order == Qt.SortOrder.AscendingOrder,
+                               inplace=True)
+        self._data.reset_index(drop=True, inplace=True)
+        self.layoutChanged.emit()
+
+    def update_data(self, type_counts):
+        """Replace the model's data with a new dictionary of counts."""
+        self.layoutAboutToBeChanged.emit()
+        df = pd.DataFrame(list(type_counts.items()), columns=["Triplet Type", "Count"])
+        df.sort_values(by="Triplet Type", inplace=True, ascending=False)   # optional initial sort
+        df.reset_index(drop=True, inplace=True)
+        self._data = df
+        self.layoutChanged.emit()
+
+    def clear(self):
+        """Remove all data from the model."""
+        self.layoutAboutToBeChanged.emit()
+        self._data = pd.DataFrame(columns=["Triplet Type", "Count"])
+        self.layoutChanged.emit()
+
+# -------------------------------------------------------------------
+# Main Window
+# -------------------------------------------------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Membrane Protein Triplet Visualiser")
+        self.setMinimumSize(1200, 800)
+
+        self.pdb_bytes = None
+        self.pdb_string = None
+        self.atom_info = None
+        self.coords = None
+        self.valid_triplets = []
+        self.type_counts = {}
+        self.type_to_residues = {}
+        self.html_cache = {}
+
+        # Central widget and main horizontal layout
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+
+        # Left panel (controls + table)
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        # File selection
+        file_group = QGroupBox("PDB File")
+        file_layout = QVBoxLayout()
+        self.file_path_edit = QLineEdit()
+        self.file_path_edit.setReadOnly(True)
+        self.browse_btn = QPushButton("Browse")
+        self.browse_btn.clicked.connect(self.browse_file)
+        file_layout.addWidget(self.file_path_edit)
+        file_layout.addWidget(self.browse_btn)
+        file_group.setLayout(file_layout)
+        left_layout.addWidget(file_group)
+
+        # Atom type selection
+        atom_group = QGroupBox("Atom Selection")
+        atom_layout = QVBoxLayout()
+        self.heavy_radio = QRadioButton("heavy (exclude H)")
+        self.heavy_radio.setChecked(True)
+        self.all_radio = QRadioButton("all (include H)")
+        atom_layout.addWidget(self.heavy_radio)
+        atom_layout.addWidget(self.all_radio)
+        atom_group.setLayout(atom_layout)
+        left_layout.addWidget(atom_group)
+
+        # Alpha value
+        alpha_group = QGroupBox("Alpha (Å)")
+        alpha_layout = QVBoxLayout()
+        self.alpha_spin = QDoubleSpinBox()
+        self.alpha_spin.setRange(1.0, 8.0)
+        self.alpha_spin.setSingleStep(0.2)
+        self.alpha_spin.setValue(3.0)
+        alpha_layout.addWidget(self.alpha_spin)
+        alpha_group.setLayout(alpha_layout)
+        left_layout.addWidget(alpha_group)
+
+        # Compute button
+        self.compute_btn = QPushButton("Compute Triplets")
+        self.compute_btn.clicked.connect(self.start_computation)
+        left_layout.addWidget(self.compute_btn)
+
+        # Info label (atoms, triplets)
+        self.info_label = QLabel("No data")
+        left_layout.addWidget(self.info_label)
+
+        # Table of triplet type counts
+        table_group = QGroupBox("Triplet Type Counts")
+        table_layout = QVBoxLayout()
+        self.type_table = QTableView()
+        self.type_table.horizontalHeader().setStretchLastSection(True)
+        self.type_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_model = TripletTableModel()
+        self.type_table.setModel(self.table_model)
+        table_layout.addWidget(self.type_table)
+        table_group.setLayout(table_layout)
+        left_layout.addWidget(table_group)
+
+        # Dropdown for selecting type to visualise
+        select_layout = QHBoxLayout()
+        select_layout.addWidget(QLabel("Show type:"))
+        self.type_combo = QComboBox()
+        self.type_combo.currentTextChanged.connect(self.on_type_selected)
+        self.type_combo.setMaxVisibleItems(10) 
+        select_layout.addWidget(self.type_combo)
+        left_layout.addLayout(select_layout)
+
+        # Right panel (web view)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        self.web_view = QWebEngineView()
+        right_layout.addWidget(self.web_view)
+
+        # Add panels to main layout
+        main_layout.addWidget(left_panel, 1)   # left takes 1 part
+        main_layout.addWidget(right_panel, 3)  # right takes 3 parts
+
+        self.worker = None
+        self.update_ui_after_compute()
+
+    def browse_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open PDB file", "", "PDB files (*.pdb)")
+        if file_path:
+            self.file_path_edit.setText(file_path)
+            with open(file_path, 'rb') as f:
+                self.pdb_bytes = f.read()
+
+    def start_computation(self):
+        if self.pdb_bytes is None:
+            QMessageBox.warning(self, "No file", "Please select a PDB file first.")
+            return
+
+        atom_type = 'heavy' if self.heavy_radio.isChecked() else 'all'
+        alpha = self.alpha_spin.value()
+
+        self.compute_btn.setEnabled(False)
+        self.info_label.setText("Computing... Please wait.")
+        self.web_view.setHtml("")
+        self.table_model.clear()
+        self.type_combo.clear()
+
+        self.worker = ComputeWorker(self.pdb_bytes, atom_type, alpha)
+        self.worker.finished.connect(self.on_computation_finished)
+        self.worker.error.connect(self.on_computation_error)
+        self.worker.start()
+
+    def on_computation_finished(self, pdb_string, atom_info, coords, valid_triplets, type_counts):
+        self.pdb_string = pdb_string
+        self.atom_info = atom_info
+        self.coords = coords
+        self.valid_triplets = valid_triplets
+        self.type_counts = type_counts
+
+        # --- New code: precompute residue sets per type ---
+        self.type_to_residues = {}
+        for trip in valid_triplets:
+            typ = trip['triplet_type']
+            if typ not in self.type_to_residues:
+                self.type_to_residues[typ] = set()
+            i, j, k = trip['atoms']
+            self.type_to_residues[typ].add((atom_info[i]['chain'], atom_info[i]['resnum']))
+            self.type_to_residues[typ].add((atom_info[j]['chain'], atom_info[j]['resnum']))
+            self.type_to_residues[typ].add((atom_info[k]['chain'], atom_info[k]['resnum']))
+        # ---------------------------------------------------
+        self.table_model.update_data(type_counts)
+        self.html_cache.clear()
+        self.update_ui_after_compute()
+        self.compute_btn.setEnabled(True)
+
+    def on_computation_error(self, error_msg):
+        QMessageBox.critical(self, "Computation Error", error_msg)
+        self.info_label.setText("Error: " + error_msg)
+        self.compute_btn.setEnabled(True)
+
+    def update_ui_after_compute(self):
+        if not self.valid_triplets:
+            self.info_label.setText("No valid triplets found.")
+            self.table_model.clear()
+            self.type_combo.clear()
+            self.type_combo.setEnabled(False)
+            return
+
+        n_atoms = len(self.coords)
+        n_triplets = len(self.valid_triplets)
+        self.info_label.setText(f"Atoms selected: {n_atoms}   |   Valid triplets: {n_triplets}")
+
+        # Fill table
+        self.table_model.update_data(self.type_counts)
+
+        # Fill combo
+        self.type_combo.clear()
+        types = self.table_model._data["Triplet Type"].tolist()
+        self.type_combo.setMaxVisibleItems(10)
+        self.type_combo.addItems(types)
+        self.type_combo.setEnabled(True)
+
+        # Show first type
+        if types:
+            self.on_type_selected(types[0])
+
+    def on_type_selected(self, triplet_type):
+        if not triplet_type or not self.valid_triplets:
+            return
+        # Get the precomputed set of residues for this type
+        if triplet_type in self.html_cache:
+            html = self.html_cache[triplet_type]
+        else:
+            residue_set = self.type_to_residues.get(triplet_type, set())
+            if not residue_set:
+                return
+
+            atom_spheres, label_positions = get_residue_sphere_coords_from_set(
+                self.atom_info, self.coords, residue_set
+            )
+            html = render_py3dmol(self.pdb_string, atom_spheres, label_positions)
+            self.html_cache[triplet_type] = html
+
+        self.web_view.setHtml(html)
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
